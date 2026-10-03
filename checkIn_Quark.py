@@ -7,6 +7,7 @@ and the newer captured-URL format are supported.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -30,19 +31,87 @@ class QuarkAPIError(RuntimeError):
 
 
 def send(title: str, message: str) -> None:
-    """Print a notification-compatible summary."""
+    """Print a notification-compatible summary and push it to Bark."""
 
     print(f"{title}:\n{message}")
+
+    server = os.getenv("BARK_SERVER", "").strip().rstrip("/")
+    key = os.getenv("BARK_KEY", "").strip()
+    if not server or not key:
+        server, key = extract_bark_config(os.getenv("COOKIE_QUARK"))
+    server = server.rstrip("/")
+    if not server or not key:
+        print("(未配置 bark_server / bark_key，跳过推送)")
+        return
+
+    body = json.dumps(
+        {
+            "device_key": key,
+            "title": title,
+            "body": message,
+            "group": "夸克签到",
+            "level": "active",
+            "isArchive": 1,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    try:
+        response = requests.post(
+            f"{server}/push", data=body, timeout=15,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        payload = response.json()
+        if payload.get("code") != 200:
+            print(f"Bark 推送失败: {payload}")
+        else:
+            print(f"Bark 推送成功: {payload.get('message')}")
+    except Exception as exc:  # 推送失败不应影响签到本身
+        print(f"Bark 推送异常（已忽略）: {type(exc).__name__}: {exc}")
+
+
+def extract_bark_config(raw_value: str | None) -> tuple[str, str]:
+    """Pull optional bark_server / bark_key fields out of the raw config.
+
+    GitHub Actions does not expose repository secrets as environment variables
+    automatically, and the workflow only forwards COOKIE_QUARK. Accepting the
+    Bark settings as extra fields lets one secret carry the whole config.
+    """
+    server = key = ""
+    for entry in (raw_value or "").splitlines():
+        for field in entry.split(";"):
+            name, separator, value = field.partition("=")
+            if not separator:
+                continue
+            name = name.strip().lower()
+            value = value.strip()
+            if name == "bark_server" and value:
+                server = value
+            elif name == "bark_key" and value:
+                key = value
+    return server, key
+
+
+def is_bark_only_entry(entry: str) -> bool:
+    """True when an entry carries Bark settings but no account credentials."""
+    fields = [
+        f.strip()
+        for f in entry.split(";")
+        if f.strip() and "=" in f and not f.strip().startswith("#")
+    ]
+    if not fields:
+        return False
+    return all(f.split("=", 1)[0].strip().lower().startswith("bark_") for f in fields)
 
 
 def split_account_entries(raw_value: str | None) -> list[str]:
     """Split COOKIE_QUARK into non-empty account entries."""
-
     if not raw_value or not raw_value.strip():
         raise ConfigError("未配置 COOKIE_QUARK，或变量内容为空")
 
     entries = [entry.strip() for entry in re.split(r"\r?\n|&&", raw_value)]
     entries = [entry for entry in entries if entry]
+    entries = [entry for entry in entries if not is_bark_only_entry(entry)]
     if not entries:
         raise ConfigError("COOKIE_QUARK 中没有可用的账号配置")
     return entries
