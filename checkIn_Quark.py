@@ -281,6 +281,31 @@ class Quark:
                 f"连签进度（{next_progress}/{target}）"
             )
 
+        # 上面的累计容量取自签到【之前】的 growth/info 快照，签完已经过时。
+        # 重新拉一次，让通知里的数字反映签到后的真实状态。
+        try:
+            fresh = self.get_growth_info()
+            fresh_cap = fresh.get("cap_sign") or {}
+            fresh_progress = fresh_cap.get("sign_progress", progress)
+            fresh_target = fresh_cap.get("sign_target", target)
+            accumulated = (fresh.get("cap_composition") or {}).get(
+                "sign_reward", accumulated
+            )
+            total_capacity = fresh.get("total_capacity", total_capacity)
+            progress, target = fresh_progress, fresh_target
+            lines[1] = (
+                f"💾 网盘总容量：{self.convert_bytes(total_capacity)}，"
+                f"签到累计容量：{self.convert_bytes(accumulated)}"
+            )
+            daily_reward = fresh_cap.get("sign_daily_reward", reward)
+            verb = "今日已签到" if fresh_cap.get("sign_daily") else "签到成功"
+            lines[2] = (
+                f"✅ {verb} +{self.convert_bytes(daily_reward)}，"
+                f"连签进度（{progress}/{target}）"
+            )
+        except Exception:  # 刷新失败不影响签到结果
+            pass
+
         return "\n".join(lines)
 
 

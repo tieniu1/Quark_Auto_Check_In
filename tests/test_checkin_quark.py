@@ -47,7 +47,6 @@ class ParsingTests(unittest.TestCase):
         )
         self.assertEqual(params, {"kps": "a+b", "sign": "s", "vcode": "v"})
 
-
     def test_extract_params_preserves_literal_plus_in_new_captured_url(self):
         params = extract_params(
             "https://drive-m.quark.cn/1/clouddrive/act/growth/reward"
@@ -74,6 +73,15 @@ class ParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "sign, vcode"):
             parse_account("user=张三; kps=k;", 1)
 
+    def test_bark_only_line_is_not_treated_as_an_account(self):
+        raw = (
+            "bark_server=https://api.day.app; bark_key=KEY;\n"
+            "user=A; kps=k; sign=s; vcode=v;"
+        )
+        self.assertEqual(
+            split_account_entries(raw), ["user=A; kps=k; sign=s; vcode=v;"]
+        )
+
 
 class ClientTests(unittest.TestCase):
     def setUp(self):
@@ -87,21 +95,23 @@ class ClientTests(unittest.TestCase):
                         "data": {
                             "88VIP": False,
                             "total_capacity": 1024,
-                            "cap_composition": {"sign_reward": 512},
+                            "cap_composition": {"sign_reward": 768},
                             "cap_sign": {
                                 "sign_daily": True,
                                 "sign_daily_reward": 256,
-                                "sign_progress": 2,
+                                "sign_progress": 3,
                                 "sign_target": 7,
                             },
                         }
                     }
-                )
+                ),
             ]
         )
         result = Quark(self.account, session=session).do_sign()
         self.assertIn("今日已签到", result)
-        self.assertEqual(len(session.calls), 1)
+        # 签到后需重新拉取 growth/info，让通知里的累计容量反映最新状态
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+        self.assertIn("768.00 B", result)
 
     def test_unsigned_account_posts_sign_request(self):
         session = FakeSession(
@@ -121,15 +131,57 @@ class ClientTests(unittest.TestCase):
                     }
                 ),
                 FakeResponse({"data": {"sign_daily_reward": 1024}}),
+                FakeResponse(
+                    {
+                        "data": {
+                            "88VIP": True,
+                            "total_capacity": 3072,
+                            "cap_composition": {"sign_reward": 1024},
+                            "cap_sign": {
+                                "sign_daily": True,
+                                "sign_daily_reward": 1024,
+                                "sign_progress": 3,
+                                "sign_target": 7,
+                            },
+                        }
+                    }
+                ),
             ]
         )
         result = Quark(self.account, session=session).do_sign()
-        self.assertIn("签到成功", result)
-        self.assertEqual([call[0] for call in session.calls], ["GET", "POST"])
+        # 刷新后状态已变为"今日已签到"，这才是签到后的真实情况
+        self.assertIn("今日已签到", result)
+        self.assertEqual([call[0] for call in session.calls], ["GET", "POST", "GET"])
+        # 刷新后应报告签到后的进度与累计容量
+        self.assertIn("3/7", result)
+        self.assertIn("1.00 KB", result)
 
     def test_api_error_is_not_treated_as_success(self):
         session = FakeSession([FakeResponse({"code": 401, "message": "凭证失效"})])
         with self.assertRaisesRegex(QuarkAPIError, "凭证失效"):
+            Quark(self.account, session=session).do_sign()
+
+    def test_sign_failure_raises(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    {
+                        "data": {
+                            "88VIP": False,
+                            "total_capacity": 1024,
+                            "cap_composition": {},
+                            "cap_sign": {
+                                "sign_daily": False,
+                                "sign_progress": 1,
+                                "sign_target": 7,
+                            },
+                        }
+                    }
+                ),
+                FakeResponse({"code": 500, "message": "服务异常"}),
+            ]
+        )
+        with self.assertRaisesRegex(QuarkAPIError, "服务异常"):
             Quark(self.account, session=session).do_sign()
 
 
@@ -166,9 +218,7 @@ class MainTests(unittest.TestCase):
                 return "✅ 签到成功"
 
         with redirect_stdout(io.StringIO()):
-            exit_code = main(
-                "user=账号;kps=1;sign=1;vcode=1;", quark_factory=StubQuark
-            )
+            exit_code = main("user=账号;kps=1;sign=1;vcode=1;", quark_factory=StubQuark)
         self.assertEqual(exit_code, 0)
 
     def test_missing_environment_returns_configuration_error(self):
