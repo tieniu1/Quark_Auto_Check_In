@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Callable
 from urllib.parse import unquote, urlparse
 
@@ -178,6 +179,9 @@ def _api_error_message(payload: dict, fallback: str) -> str:
     return fallback
 
 
+RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
 class Quark:
     """Small client for Quark's mobile growth endpoints."""
 
@@ -185,11 +189,15 @@ class Quark:
         self,
         account: dict[str, str],
         session: requests.Session | None = None,
-        timeout: int = 20,
+        timeout: int = 60,
+        retries: int = 3,
+        retry_backoff: float = 5.0,
     ) -> None:
         self.account = account
         self.session = session or requests.Session()
         self.timeout = timeout
+        self.retries = max(1, retries)
+        self.retry_backoff = retry_backoff
 
     @staticmethod
     def convert_bytes(value: int | float) -> str:
@@ -209,24 +217,56 @@ class Quark:
         }
 
     def _request(self, method: str, url: str, **kwargs) -> dict:
-        try:
-            response = self.session.request(
-                method, url, timeout=self.timeout, **kwargs
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except requests.Timeout as exc:
-            raise QuarkAPIError("请求夸克接口超时") from exc
-        except requests.RequestException as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            detail = f"HTTP {status}" if status else type(exc).__name__
-            raise QuarkAPIError(f"请求夸克接口失败（{detail}）") from exc
-        except ValueError as exc:
-            raise QuarkAPIError("夸克接口返回了无法解析的数据") from exc
+        """Send a request, retrying transient network and server failures.
 
-        if not isinstance(payload, dict):
-            raise QuarkAPIError("夸克接口返回格式异常")
-        return payload
+        GitHub-hosted scheduled runners frequently start from a congested
+        network, where a single short-timeout request fails outright. Retrying
+        with backoff absorbs that without changing the account workflow.
+        """
+        last_error: Exception | None = None
+        reason = "请求夸克接口失败"
+
+        for attempt in range(1, self.retries + 1):
+            try:
+                response = self.session.request(
+                    method, url, timeout=self.timeout, **kwargs
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except requests.Timeout as exc:
+                last_error = exc
+                reason = "请求夸克接口超时"
+            except requests.RequestException as exc:
+                status = getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                if status is not None and status not in RETRYABLE_STATUS:
+                    raise QuarkAPIError(
+                        f"请求夸克接口失败（HTTP {status}）"
+                    ) from exc
+                last_error = exc
+                reason = (
+                    f"请求夸克接口失败（HTTP {status}）"
+                    if status
+                    else f"网络异常（{type(exc).__name__}）"
+                )
+            except ValueError as exc:
+                raise QuarkAPIError("夸克接口返回了无法解析的数据") from exc
+            else:
+                if not isinstance(payload, dict):
+                    raise QuarkAPIError("夸克接口返回格式异常")
+                return payload
+
+            if attempt < self.retries:
+                wait = self.retry_backoff * (2 ** (attempt - 1))
+                print(
+                    f"⚠️  {reason}（{attempt}/{self.retries}），"
+                    f"{wait:.0f} 秒后重试"
+                )
+                time.sleep(wait)
+
+        assert last_error is not None
+        raise QuarkAPIError(f"{reason}（已重试 {self.retries} 次）") from last_error
 
     def get_growth_info(self) -> dict:
         payload = self._request("GET", INFO_URL, params=self._params())

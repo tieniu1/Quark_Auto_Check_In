@@ -83,6 +83,22 @@ class ParsingTests(unittest.TestCase):
         )
 
 
+class FlakySession:
+    """Fails the first `fail_times` calls, then succeeds."""
+
+    def __init__(self, responses, fail_times=0, exc=None):
+        self.responses = list(responses)
+        self.fail_times = fail_times
+        self.exc = exc or __import__("requests").Timeout("boom")
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        if len(self.calls) <= self.fail_times:
+            raise self.exc
+        return self.responses.pop(0)
+
+
 class ClientTests(unittest.TestCase):
     def setUp(self):
         self.account = {"user": "测试", "kps": "k", "sign": "s", "vcode": "v"}
@@ -160,6 +176,50 @@ class ClientTests(unittest.TestCase):
         session = FakeSession([FakeResponse({"code": 401, "message": "凭证失效"})])
         with self.assertRaisesRegex(QuarkAPIError, "凭证失效"):
             Quark(self.account, session=session).do_sign()
+
+    def test_transient_timeout_is_retried_then_succeeds(self):
+        payload = {
+            "data": {
+                "88VIP": False,
+                "total_capacity": 1024,
+                "cap_composition": {"sign_reward": 512},
+                "cap_sign": {
+                    "sign_daily": True,
+                    "sign_daily_reward": 256,
+                    "sign_progress": 2,
+                    "sign_target": 7,
+                },
+            }
+        }
+        session = FlakySession([FakeResponse(payload), FakeResponse(payload)], fail_times=2)
+        client = Quark(self.account, session=session, retry_backoff=0)
+        with redirect_stdout(io.StringIO()) as out:
+            result = client.do_sign()
+        self.assertIn("今日已签到", result)
+        # 前两次调用失败并重试；成功后 do_sign 还会再拉一次 info 刷新容量
+        self.assertEqual(len(session.calls), 4)
+        self.assertIn("重试", out.getvalue())
+
+    def test_permanent_failure_reports_after_all_retries(self):
+        session = FlakySession([], fail_times=99)
+        client = Quark(self.account, session=session, retries=2, retry_backoff=0)
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(QuarkAPIError, "已重试 2 次"):
+                client.do_sign()
+        self.assertEqual(len(session.calls), 2)
+
+    def test_non_retryable_status_fails_immediately(self):
+        import requests
+
+        response = FakeResponse({"code": 403}, status_code=403)
+        error = requests.HTTPError("forbidden")
+        error.response = response
+        session = FlakySession([response], fail_times=99, exc=error)
+        client = Quark(self.account, session=session, retries=3, retry_backoff=0)
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(QuarkAPIError, "HTTP 403"):
+                client.do_sign()
+        self.assertEqual(len(session.calls), 1)
 
     def test_sign_failure_raises(self):
         session = FakeSession(
